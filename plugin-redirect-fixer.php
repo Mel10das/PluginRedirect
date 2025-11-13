@@ -141,19 +141,48 @@ class Plugin_Redirect_Fixer {
      */
     public function scan_content_for_redirects($content) {
         $links = array();
+        $all_urls = array();
 
-        // Находим все ссылки в контенте
+        // 1. Находим ссылки в HTML тегах <a href="">
         preg_match_all('/<a[^>]+href=["\'](https?:\/\/[^"\']+)["\'][^>]*>/i', $content, $matches);
-
         if (!empty($matches[1])) {
-            $unique_urls = array_unique($matches[1]);
+            $all_urls = array_merge($all_urls, $matches[1]);
+        }
 
-            foreach ($unique_urls as $url) {
-                $redirect_info = $this->check_redirect($url);
+        // 2. Находим голые URL в тексте
+        preg_match_all('/(?<!href=["\'])(?<!src=["\'])(https?:\/\/[^\s<>"{}|\\^\[\]`]+)/i', $content, $matches);
+        if (!empty($matches[1])) {
+            $all_urls = array_merge($all_urls, $matches[1]);
+        }
 
-                if ($redirect_info['has_redirect']) {
-                    $links[] = $redirect_info;
+        // 3. Находим URL в одинарных кавычках (например в атрибутах)
+        preg_match_all('/href=[\'](https?:\/\/[^\']+)[\']|src=[\'](https?:\/\/[^\']+)[\']|url\([\'"]?(https?:\/\/[^\'")\s]+)[\'"]?\)/i', $content, $matches);
+        foreach ($matches as $match_group) {
+            if (!empty($match_group)) {
+                foreach ($match_group as $url) {
+                    if ($url && strpos($url, 'http') === 0) {
+                        $all_urls[] = $url;
+                    }
                 }
+            }
+        }
+
+        // Убираем дубликаты
+        $unique_urls = array_unique($all_urls);
+
+        // Проверяем каждый URL на редиректы
+        foreach ($unique_urls as $url) {
+            // Очищаем URL от trailing символов
+            $url = rtrim($url, '.,;:!?)');
+
+            if (empty($url)) {
+                continue;
+            }
+
+            $redirect_info = $this->check_redirect($url);
+
+            if ($redirect_info['has_redirect']) {
+                $links[] = $redirect_info;
             }
         }
 
@@ -172,16 +201,41 @@ class Plugin_Redirect_Fixer {
             $original_url = $redirect['original_url'];
             $final_url = $redirect['final_url'];
 
-            // Заменяем URL в атрибутах href
-            $content = str_replace(
-                'href="' . $original_url . '"',
+            // Экранируем специальные символы для регулярного выражения
+            $escaped_url = preg_quote($original_url, '/');
+
+            // Заменяем URL везде в контенте
+            // 1. В атрибутах href с двойными кавычками
+            $content = preg_replace(
+                '/href="' . $escaped_url . '"/i',
                 'href="' . $final_url . '"',
                 $content
             );
 
-            $content = str_replace(
-                "href='" . $original_url . "'",
+            // 2. В атрибутах href с одинарными кавычками
+            $content = preg_replace(
+                "/href='" . $escaped_url . "'/i",
                 "href='" . $final_url . "'",
+                $content
+            );
+
+            // 3. В голом тексте (не в кавычках)
+            $content = preg_replace(
+                '/(?<!["\'=])' . $escaped_url . '(?!["\'=])/i',
+                $final_url,
+                $content
+            );
+
+            // 4. В других атрибутах (src, data-url и т.д.)
+            $content = preg_replace(
+                '/(src|data-url|data-href)="' . $escaped_url . '"/i',
+                '$1="' . $final_url . '"',
+                $content
+            );
+
+            $content = preg_replace(
+                "/(src|data-url|data-href)='" . $escaped_url . "'/i",
+                "$1='" . $final_url . "'",
                 $content
             );
         }
@@ -693,21 +747,19 @@ class Plugin_Redirect_Fixer {
             $(document).on('click', '.prf-fix-button', function() {
                 var button = $(this);
                 var postId = button.data('post-id');
-                var postItem = button.closest('.prf-post-item');
-                var redirects = [];
 
-                postItem.find('.prf-redirect-item').each(function() {
-                    var text = $(this).text();
-                    var originalMatch = text.match(/Оригинальный URL:\s*(.+?)(?:\s|$)/);
-                    var finalMatch = text.match(/Конечный URL:\s*(.+?)(?:\s|$)/);
+                // Получаем редиректы из сохраненных данных
+                if (!scanResults[postId] || !scanResults[postId].redirects) {
+                    alert('Ошибка: данные о редиректах не найдены');
+                    return;
+                }
 
-                    if (originalMatch && finalMatch) {
-                        redirects.push({
-                            original_url: originalMatch[1].trim(),
-                            final_url: finalMatch[1].trim()
-                        });
-                    }
-                });
+                var redirects = scanResults[postId].redirects;
+
+                if (redirects.length === 0) {
+                    alert('Нет редиректов для исправления');
+                    return;
+                }
 
                 if (!confirm('Вы уверены, что хотите заменить ' + redirects.length + ' ссылок?')) {
                     return;
