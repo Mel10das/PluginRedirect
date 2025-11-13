@@ -2,8 +2,8 @@
 /**
  * Plugin Name: Plugin Redirect Fixer
  * Plugin URI: https://github.com/Mel10das/PluginRedirect
- * Description: Автоматически находит и заменяет ссылки с 301 редиректом на конечные URL. Пакетное сканирование для сайтов с тысячами страниц. Массовое исправление одним кликом.
- * Version: 1.2.0
+ * Description: Автоматически находит и заменяет ссылки с 301 редиректом на конечные URL. Пакетное сканирование для сайтов с тысячами страниц. Поиск битых ссылок (404). Массовое исправление одним кликом.
+ * Version: 1.3.0
  * Author: Mel10das
  * Author URI: https://github.com/Mel10das
  * License: GPL v2 or later
@@ -63,6 +63,8 @@ class Plugin_Redirect_Fixer {
         add_action('wp_ajax_prf_scan_single_page', array($this, 'ajax_scan_single_page'));
         add_action('wp_ajax_prf_get_posts_count', array($this, 'ajax_get_posts_count'));
         add_action('wp_ajax_prf_fix_all_redirects', array($this, 'ajax_fix_all_redirects'));
+        add_action('wp_ajax_prf_scan_broken_links', array($this, 'ajax_scan_broken_links'));
+        add_action('wp_ajax_prf_fix_broken_links', array($this, 'ajax_fix_broken_links'));
     }
 
     /**
@@ -555,6 +557,196 @@ class Plugin_Redirect_Fixer {
     }
 
     /**
+     * Проверяет URL на 404 ошибку
+     *
+     * @param string $url URL для проверки
+     * @return array Информация о статусе
+     */
+    public function check_404($url) {
+        $response = wp_remote_head($url, array(
+            'timeout' => 10,
+            'sslverify' => false,
+            'redirection' => 5
+        ));
+
+        if (is_wp_error($response)) {
+            return array(
+                'url' => $url,
+                'is_broken' => true,
+                'status_code' => 0,
+                'error' => $response->get_error_message()
+            );
+        }
+
+        $status_code = wp_remote_retrieve_response_code($response);
+
+        return array(
+            'url' => $url,
+            'is_broken' => in_array($status_code, array(404, 410, 0)),
+            'status_code' => $status_code,
+            'error' => null
+        );
+    }
+
+    /**
+     * Сканирует контент на наличие битых ссылок (404)
+     *
+     * @param string $content Контент для сканирования
+     * @return array Массив битых ссылок
+     */
+    public function scan_content_for_broken_links($content) {
+        $broken_links = array();
+        $all_urls = array();
+
+        // 1. Находим ссылки в HTML тегах <a href="">
+        preg_match_all('/<a[^>]+href=["\'](https?:\/\/[^"\']+)["\'][^>]*>/i', $content, $matches);
+        if (!empty($matches[1])) {
+            $all_urls = array_merge($all_urls, $matches[1]);
+        }
+
+        // 2. Находим голые URL в тексте
+        preg_match_all('/(?<!href=["\'])(?<!src=["\'])(https?:\/\/[^\s<>"{}|\\^\[\]`]+)/i', $content, $matches);
+        if (!empty($matches[1])) {
+            $all_urls = array_merge($all_urls, $matches[1]);
+        }
+
+        // Убираем дубликаты
+        $unique_urls = array_unique($all_urls);
+
+        // Проверяем каждый URL на 404
+        foreach ($unique_urls as $url) {
+            $url = rtrim($url, '.,;:!?)');
+
+            if (empty($url)) {
+                continue;
+            }
+
+            $check_result = $this->check_404($url);
+
+            if ($check_result['is_broken']) {
+                $broken_links[] = $check_result;
+            }
+        }
+
+        return $broken_links;
+    }
+
+    /**
+     * AJAX: Сканирование битых ссылок (404) с пакетной обработкой
+     */
+    public function ajax_scan_broken_links() {
+        check_ajax_referer('prf_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => 'Недостаточно прав'));
+        }
+
+        $batch_size = 20;
+        $offset = isset($_POST['offset']) ? intval($_POST['offset']) : 0;
+
+        $args = array(
+            'post_type' => array('post', 'page'),
+            'posts_per_page' => $batch_size,
+            'offset' => $offset,
+            'post_status' => 'publish',
+            'orderby' => 'ID',
+            'order' => 'ASC'
+        );
+
+        $posts = get_posts($args);
+        $batch_broken = array();
+
+        foreach ($posts as $post) {
+            $broken_links = $this->scan_content_for_broken_links($post->post_content);
+            if (!empty($broken_links)) {
+                $batch_broken[$post->ID] = array(
+                    'title' => $post->post_title,
+                    'url' => get_permalink($post->ID),
+                    'broken_links' => $broken_links
+                );
+            }
+        }
+
+        $batch_broken_count = 0;
+        foreach ($batch_broken as $post_data) {
+            $batch_broken_count += count($post_data['broken_links']);
+        }
+
+        wp_send_json_success(array(
+            'posts' => $batch_broken,
+            'batch_size' => count($posts),
+            'has_more' => count($posts) === $batch_size,
+            'next_offset' => $offset + $batch_size,
+            'batch_posts_with_broken' => count($batch_broken),
+            'batch_broken_count' => $batch_broken_count
+        ));
+    }
+
+    /**
+     * AJAX: Исправление битых ссылок (замена на URL текущей страницы)
+     */
+    public function ajax_fix_broken_links() {
+        check_ajax_referer('prf_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => 'Недостаточно прав'));
+        }
+
+        $post_id = isset($_POST['post_id']) ? intval($_POST['post_id']) : 0;
+        $broken_links = isset($_POST['broken_links']) ? json_decode(stripslashes($_POST['broken_links']), true) : array();
+
+        if ($post_id > 0 && !empty($broken_links)) {
+            $post = get_post($post_id);
+            if ($post) {
+                $page_url = get_permalink($post_id);
+                $content = $post->post_content;
+
+                // Заменяем каждую битую ссылку на URL текущей страницы
+                foreach ($broken_links as $broken) {
+                    $broken_url = $broken['url'];
+                    $escaped_url = preg_quote($broken_url, '/');
+
+                    // Заменяем в атрибутах href
+                    $content = preg_replace(
+                        '/href="' . $escaped_url . '"/i',
+                        'href="' . $page_url . '"',
+                        $content
+                    );
+
+                    $content = preg_replace(
+                        "/href='" . $escaped_url . "'/i",
+                        "href='" . $page_url . "'",
+                        $content
+                    );
+
+                    // Заменяем голые URL
+                    $content = preg_replace(
+                        '/(?<!["\'=])' . $escaped_url . '(?!["\'=])/i',
+                        $page_url,
+                        $content
+                    );
+                }
+
+                $result = wp_update_post(array(
+                    'ID' => $post_id,
+                    'post_content' => $content
+                ));
+
+                if ($result) {
+                    wp_send_json_success(array(
+                        'message' => 'Битые ссылки успешно исправлены',
+                        'fixed_count' => count($broken_links)
+                    ));
+                } else {
+                    wp_send_json_error(array('message' => 'Ошибка при обновлении поста'));
+                }
+            }
+        }
+
+        wp_send_json_error(array('message' => 'Неверные параметры'));
+    }
+
+    /**
      * Отображает страницу админки
      */
     public function render_admin_page() {
@@ -566,6 +758,7 @@ class Plugin_Redirect_Fixer {
             <div class="prf-admin-container">
                 <div class="prf-tabs">
                     <button class="prf-tab-button active" data-tab="scanner">Сканер контента</button>
+                    <button class="prf-tab-button" data-tab="broken">Битые ссылки (404)</button>
                     <button class="prf-tab-button" data-tab="checker">Проверка URL</button>
                     <button class="prf-tab-button" data-tab="settings">Настройки</button>
                 </div>
@@ -601,6 +794,31 @@ class Plugin_Redirect_Fixer {
                         <button id="prf-export-csv" class="button">📥 Экспорт в CSV</button>
                         <button id="prf-export-json" class="button">📥 Экспорт в JSON</button>
                         <button id="prf-fix-all" class="button button-primary" style="margin-left: 10px;">🔧 Исправить все редиректы</button>
+                    </div>
+                </div>
+
+                <!-- Вкладка: Битые ссылки (404) -->
+                <div id="prf-tab-broken" class="prf-tab-content" style="display: none;">
+                    <h2>Поиск битых ссылок (404)</h2>
+                    <p>Сканирует все посты и страницы на наличие битых ссылок (404, 410 и недоступные URL).<br>
+                    Битые ссылки будут заменены на URL текущей страницы, на которой они найдены.</p>
+
+                    <div class="prf-scan-section">
+                        <button id="prf-scan-broken-button" class="button button-primary">Начать сканирование на 404</button>
+                    </div>
+
+                    <div id="prf-broken-progress" style="margin-top: 20px; display: none;">
+                        <div style="background: #f0f0f0; border-radius: 5px; height: 30px; overflow: hidden;">
+                            <div id="prf-broken-progress-bar" style="background: linear-gradient(90deg, #f44336, #ff5722); height: 100%; width: 0%; transition: width 0.3s; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold;"></div>
+                        </div>
+                        <p id="prf-broken-progress-text" style="margin-top: 10px; text-align: center;"></p>
+                    </div>
+
+                    <div id="prf-broken-results" style="margin-top: 20px;"></div>
+
+                    <div id="prf-broken-buttons" style="margin-top: 15px; display: none;">
+                        <h3>Массовые операции</h3>
+                        <button id="prf-fix-all-broken" class="button button-primary">🔧 Исправить все битые ссылки</button>
                     </div>
                 </div>
 
@@ -697,6 +915,7 @@ class Plugin_Redirect_Fixer {
         jQuery(document).ready(function($) {
             // Глобальная переменная для хранения результатов сканирования
             var scanResults = {};
+            var brokenResults = {}; // Результаты сканирования битых ссылок
 
             // Переключение вкладок
             $('.prf-tab-button').on('click', function() {
@@ -1134,6 +1353,284 @@ class Plugin_Redirect_Fixer {
                         button.prop('disabled', false).text('Проверить');
                     }
                 });
+            });
+
+            // ========== БИТЫЕ ССЫЛКИ (404) ==========
+
+            // Сканирование на битые ссылки (пакетно)
+            $('#prf-scan-broken-button').on('click', function() {
+                var button = $(this);
+                button.prop('disabled', true).text('⏳ Сканирование...');
+
+                // Скрываем результаты и показываем прогресс
+                $('#prf-broken-results').html('');
+                $('#prf-broken-buttons').hide();
+                $('#prf-broken-progress').show();
+                $('#prf-broken-progress-bar').css('width', '0%').text('0%');
+
+                // Очищаем предыдущие результаты
+                brokenResults = {};
+
+                // Сначала получаем количество постов
+                $.ajax({
+                    url: ajaxurl,
+                    type: 'POST',
+                    data: {
+                        action: 'prf_get_posts_count',
+                        nonce: '<?php echo wp_create_nonce('prf_nonce'); ?>'
+                    },
+                    success: function(response) {
+                        if (response.success) {
+                            var totalPosts = response.data.total_posts;
+                            var offset = 0;
+                            var totalPostsWithBroken = 0;
+                            var totalBrokenCount = 0;
+
+                            // Запускаем пакетное сканирование
+                            function scanBrokenBatch() {
+                                $.ajax({
+                                    url: ajaxurl,
+                                    type: 'POST',
+                                    data: {
+                                        action: 'prf_scan_broken_links',
+                                        nonce: '<?php echo wp_create_nonce('prf_nonce'); ?>',
+                                        offset: offset
+                                    },
+                                    success: function(batchResponse) {
+                                        if (batchResponse.success) {
+                                            var data = batchResponse.data;
+
+                                            // Добавляем результаты этого пакета
+                                            $.each(data.posts, function(postId, postData) {
+                                                brokenResults[postId] = postData;
+                                            });
+
+                                            totalPostsWithBroken += data.batch_posts_with_broken;
+                                            totalBrokenCount += data.batch_broken_count;
+
+                                            // Обновляем прогресс
+                                            var processed = offset + data.batch_size;
+                                            var progress = Math.min(100, Math.round((processed / totalPosts) * 100));
+                                            $('#prf-broken-progress-bar').css('width', progress + '%').text(progress + '%');
+                                            $('#prf-broken-progress-text').text('Обработано: ' + processed + ' из ' + totalPosts + ' постов | Найдено битых ссылок: ' + totalBrokenCount);
+
+                                            // Если есть еще посты, продолжаем
+                                            if (data.has_more) {
+                                                offset = data.next_offset;
+                                                setTimeout(scanBrokenBatch, 100);
+                                            } else {
+                                                // Сканирование завершено
+                                                $('#prf-broken-progress').hide();
+
+                                                displayBrokenResults({
+                                                    posts: brokenResults,
+                                                    total_posts: totalPostsWithBroken,
+                                                    total_broken: totalBrokenCount
+                                                });
+
+                                                button.prop('disabled', false).text('Начать сканирование на 404');
+                                            }
+                                        } else {
+                                            $('#prf-broken-progress').hide();
+                                            $('#prf-broken-results').html('<div class="notice notice-error"><p>Ошибка: ' + batchResponse.data.message + '</p></div>');
+                                            button.prop('disabled', false).text('Начать сканирование на 404');
+                                        }
+                                    },
+                                    error: function() {
+                                        $('#prf-broken-progress').hide();
+                                        $('#prf-broken-results').html('<div class="notice notice-error"><p>Произошла ошибка при сканировании пакета</p></div>');
+                                        button.prop('disabled', false).text('Начать сканирование на 404');
+                                    }
+                                });
+                            }
+
+                            scanBrokenBatch();
+                        } else {
+                            $('#prf-broken-progress').hide();
+                            $('#prf-broken-results').html('<div class="notice notice-error"><p>Ошибка получения количества постов</p></div>');
+                            button.prop('disabled', false).text('Начать сканирование на 404');
+                        }
+                    },
+                    error: function() {
+                        $('#prf-broken-progress').hide();
+                        $('#prf-broken-results').html('<div class="notice notice-error"><p>Произошла ошибка при подсчете постов</p></div>');
+                        button.prop('disabled', false).text('Начать сканирование на 404');
+                    }
+                });
+            });
+
+            // Функция отображения битых ссылок
+            function displayBrokenResults(data) {
+                var html = '';
+                brokenResults = data.posts || {};
+
+                html = '<div class="notice notice-success"><p>✅ Сканирование завершено! Найдено постов с битыми ссылками: ' + data.total_posts + ', всего битых ссылок: ' + data.total_broken + '</p></div>';
+
+                if (Object.keys(brokenResults).length > 0) {
+                    $.each(brokenResults, function(postId, postData) {
+                        html += '<div class="prf-post-item">';
+                        html += '<div class="prf-post-title">📄 ' + postData.title + '</div>';
+                        html += '<div style="margin-bottom: 10px;">';
+                        html += '<a href="' + postData.url + '" target="_blank">🔗 Просмотр</a> | ';
+                        html += '<a href="/wp-admin/post.php?post=' + postId + '&action=edit" target="_blank">✏️ Редактировать</a>';
+                        html += '</div>';
+                        html += '<div style="margin-top: 10px;">';
+
+                        $.each(postData.broken_links, function(i, broken) {
+                            html += '<div class="prf-redirect-item" style="border-left-color: #f44336;">';
+                            html += '<strong>❌ Битая ссылка:</strong> <code>' + broken.url + '</code><br>';
+                            html += '<strong>🔴 HTTP Status:</strong> ' + broken.status_code;
+                            if (broken.error) {
+                                html += '<br><strong>⚠️ Ошибка:</strong> ' + broken.error;
+                            }
+                            html += '<br><strong>🔄 Будет заменена на:</strong> <code>' + postData.url + '</code>';
+                            html += '</div>';
+                        });
+
+                        html += '</div>';
+                        html += '<button class="button button-primary prf-fix-broken-button" data-post-id="' + postId + '" style="margin-top: 10px;">🔧 Исправить битые ссылки</button>';
+                        html += '</div>';
+                    });
+
+                    // Показываем кнопку массового исправления
+                    $('#prf-broken-buttons').show();
+                } else {
+                    html += '<div class="notice notice-info"><p>✅ Битые ссылки не найдены!</p></div>';
+                    $('#prf-broken-buttons').hide();
+                }
+
+                $('#prf-broken-results').html(html);
+            }
+
+            // Исправление битых ссылок для одного поста
+            $(document).on('click', '.prf-fix-broken-button', function() {
+                var button = $(this);
+                var postId = button.data('post-id');
+                var postItem = button.closest('.prf-post-item');
+
+                if (!brokenResults[postId] || !brokenResults[postId].broken_links) {
+                    alert('Ошибка: данные о битых ссылках не найдены');
+                    return;
+                }
+
+                var brokenLinks = brokenResults[postId].broken_links;
+
+                if (brokenLinks.length === 0) {
+                    alert('Нет битых ссылок для исправления');
+                    return;
+                }
+
+                if (!confirm('Вы уверены, что хотите заменить ' + brokenLinks.length + ' битых ссылок на URL текущей страницы?')) {
+                    return;
+                }
+
+                button.prop('disabled', true).text('Исправление...');
+
+                $.ajax({
+                    url: ajaxurl,
+                    type: 'POST',
+                    data: {
+                        action: 'prf_fix_broken_links',
+                        nonce: '<?php echo wp_create_nonce('prf_nonce'); ?>',
+                        post_id: postId,
+                        broken_links: JSON.stringify(brokenLinks)
+                    },
+                    success: function(response) {
+                        if (response.success) {
+                            postItem.css('background-color', '#d4edda');
+                            button.text('✅ Исправлено!').css('background-color', '#28a745');
+
+                            setTimeout(function() {
+                                postItem.fadeOut();
+                            }, 2000);
+                        } else {
+                            alert('Ошибка: ' + response.data.message);
+                            button.prop('disabled', false).text('🔧 Исправить битые ссылки');
+                        }
+                    },
+                    error: function() {
+                        alert('Произошла ошибка при исправлении битых ссылок');
+                        button.prop('disabled', false).text('🔧 Исправить битые ссылки');
+                    }
+                });
+            });
+
+            // Массовое исправление всех битых ссылок
+            $('#prf-fix-all-broken').on('click', function() {
+                if (Object.keys(brokenResults).length === 0) {
+                    alert('Нет данных для исправления');
+                    return;
+                }
+
+                var postIds = Object.keys(brokenResults);
+                var totalBroken = 0;
+                $.each(brokenResults, function(postId, postData) {
+                    totalBroken += postData.broken_links.length;
+                });
+
+                if (!confirm('Вы уверены, что хотите исправить ' + totalBroken + ' битых ссылок на ' + postIds.length + ' страницах?\n\nВсе битые ссылки будут заменены на URL текущей страницы!')) {
+                    return;
+                }
+
+                var button = $(this);
+                button.prop('disabled', true).text('⏳ Исправление...');
+
+                var fixedCount = 0;
+                var failedCount = 0;
+
+                // Исправляем каждый пост последовательно
+                function fixNextPost(index) {
+                    if (index >= postIds.length) {
+                        // Все посты обработаны
+                        alert('✅ Исправление завершено!\n\nУспешно: ' + fixedCount + '\nОшибок: ' + failedCount);
+
+                        // Убираем исправленные посты
+                        $.each(postIds, function(i, postId) {
+                            $('.prf-fix-broken-button[data-post-id="' + postId + '"]').closest('.prf-post-item').fadeOut();
+                        });
+
+                        brokenResults = {};
+
+                        setTimeout(function() {
+                            button.prop('disabled', false).text('🔧 Исправить все битые ссылки');
+                            $('#prf-broken-buttons').hide();
+                            $('#prf-broken-results').html('<div class="notice notice-success"><p>✅ Все битые ссылки исправлены!</p></div>');
+                        }, 1000);
+
+                        return;
+                    }
+
+                    var postId = postIds[index];
+                    var brokenLinks = brokenResults[postId].broken_links;
+
+                    $.ajax({
+                        url: ajaxurl,
+                        type: 'POST',
+                        data: {
+                            action: 'prf_fix_broken_links',
+                            nonce: '<?php echo wp_create_nonce('prf_nonce'); ?>',
+                            post_id: postId,
+                            broken_links: JSON.stringify(brokenLinks)
+                        },
+                        success: function(response) {
+                            if (response.success) {
+                                fixedCount++;
+                            } else {
+                                failedCount++;
+                            }
+                            // Обрабатываем следующий пост
+                            fixNextPost(index + 1);
+                        },
+                        error: function() {
+                            failedCount++;
+                            // Обрабатываем следующий пост
+                            fixNextPost(index + 1);
+                        }
+                    });
+                }
+
+                // Начинаем с первого поста
+                fixNextPost(0);
             });
         });
         </script>
