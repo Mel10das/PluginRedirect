@@ -2,8 +2,8 @@
 /**
  * Plugin Name: Plugin Redirect Fixer
  * Plugin URI: https://github.com/Mel10das/PluginRedirect
- * Description: Автоматически находит и заменяет ссылки с 301 редиректом на конечные URL в контенте WordPress
- * Version: 1.0.0
+ * Description: Автоматически находит и заменяет ссылки с 301 редиректом на конечные URL в контенте WordPress. Поддержка экспорта в CSV/JSON и сканирования отдельных страниц.
+ * Version: 1.1.0
  * Author: Mel10das
  * Author URI: https://github.com/Mel10das
  * License: GPL v2 or later
@@ -59,6 +59,8 @@ class Plugin_Redirect_Fixer {
         add_action('wp_ajax_prf_scan_content', array($this, 'ajax_scan_content'));
         add_action('wp_ajax_prf_fix_redirects', array($this, 'ajax_fix_redirects'));
         add_action('wp_ajax_prf_check_url', array($this, 'ajax_check_url'));
+        add_action('wp_ajax_prf_export_results', array($this, 'ajax_export_results'));
+        add_action('wp_ajax_prf_scan_single_page', array($this, 'ajax_scan_single_page'));
     }
 
     /**
@@ -327,6 +329,100 @@ class Plugin_Redirect_Fixer {
     }
 
     /**
+     * AJAX: Экспорт результатов сканирования
+     */
+    public function ajax_export_results() {
+        check_ajax_referer('prf_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => 'Недостаточно прав'));
+        }
+
+        $format = isset($_POST['format']) ? sanitize_text_field($_POST['format']) : 'csv';
+        $data = isset($_POST['data']) ? json_decode(stripslashes($_POST['data']), true) : array();
+
+        if (empty($data)) {
+            wp_send_json_error(array('message' => 'Нет данных для экспорта'));
+        }
+
+        if ($format === 'csv') {
+            $csv_output = "Post ID,Post Title,Post URL,Original URL,Final URL,Redirect Count\n";
+
+            foreach ($data as $post_id => $post_data) {
+                foreach ($post_data['redirects'] as $redirect) {
+                    $csv_output .= sprintf(
+                        '"%s","%s","%s","%s","%s","%s"' . "\n",
+                        $post_id,
+                        str_replace('"', '""', $post_data['title']),
+                        $post_data['url'],
+                        $redirect['original_url'],
+                        $redirect['final_url'],
+                        $redirect['redirect_count']
+                    );
+                }
+            }
+
+            wp_send_json_success(array(
+                'format' => 'csv',
+                'content' => $csv_output,
+                'filename' => 'redirect-report-' . date('Y-m-d') . '.csv'
+            ));
+        } else {
+            // JSON формат
+            $json_output = array(
+                'export_date' => date('Y-m-d H:i:s'),
+                'total_posts' => count($data),
+                'posts' => $data
+            );
+
+            wp_send_json_success(array(
+                'format' => 'json',
+                'content' => json_encode($json_output, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE),
+                'filename' => 'redirect-report-' . date('Y-m-d') . '.json'
+            ));
+        }
+    }
+
+    /**
+     * AJAX: Сканирование одной страницы по URL
+     */
+    public function ajax_scan_single_page() {
+        check_ajax_referer('prf_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => 'Недостаточно прав'));
+        }
+
+        $page_url = isset($_POST['page_url']) ? esc_url_raw($_POST['page_url']) : '';
+
+        if (empty($page_url)) {
+            wp_send_json_error(array('message' => 'URL страницы не указан'));
+        }
+
+        // Получаем ID поста по URL
+        $post_id = url_to_postid($page_url);
+
+        if (!$post_id) {
+            wp_send_json_error(array('message' => 'Страница не найдена'));
+        }
+
+        $post = get_post($post_id);
+        if (!$post) {
+            wp_send_json_error(array('message' => 'Пост не найден'));
+        }
+
+        $redirects = $this->scan_content_for_redirects($post->post_content);
+
+        wp_send_json_success(array(
+            'post_id' => $post_id,
+            'title' => $post->post_title,
+            'url' => get_permalink($post_id),
+            'redirects' => $redirects,
+            'count' => count($redirects)
+        ));
+    }
+
+    /**
      * Отображает страницу админки
      */
     public function render_admin_page() {
@@ -345,11 +441,27 @@ class Plugin_Redirect_Fixer {
                 <!-- Вкладка: Сканер -->
                 <div id="prf-tab-scanner" class="prf-tab-content active">
                     <h2>Сканирование контента</h2>
-                    <p>Сканирует все опубликованные посты и страницы на наличие ссылок с редиректами.</p>
 
-                    <button id="prf-scan-button" class="button button-primary">Начать сканирование</button>
+                    <div class="prf-scan-section">
+                        <h3>Сканирование всего сайта</h3>
+                        <p>Сканирует все опубликованные посты и страницы на наличие ссылок с редиректами.</p>
+                        <button id="prf-scan-button" class="button button-primary">Начать полное сканирование</button>
+                    </div>
+
+                    <div class="prf-scan-section" style="margin-top: 30px;">
+                        <h3>Сканирование конкретной страницы</h3>
+                        <p>Введите URL страницы для проверки на редиректы.</p>
+                        <input type="url" id="prf-page-url" class="regular-text" placeholder="https://ladyelena.ru/your-page/">
+                        <button id="prf-scan-page-button" class="button button-primary">Сканировать страницу</button>
+                    </div>
 
                     <div id="prf-scan-results" style="margin-top: 20px;"></div>
+
+                    <div id="prf-export-buttons" style="margin-top: 15px; display: none;">
+                        <h3>Экспорт результатов</h3>
+                        <button id="prf-export-csv" class="button">📥 Экспорт в CSV</button>
+                        <button id="prf-export-json" class="button">📥 Экспорт в JSON</button>
+                    </div>
                 </div>
 
                 <!-- Вкладка: Проверка URL -->
@@ -443,6 +555,9 @@ class Plugin_Redirect_Fixer {
 
         <script>
         jQuery(document).ready(function($) {
+            // Глобальная переменная для хранения результатов сканирования
+            var scanResults = {};
+
             // Переключение вкладок
             $('.prf-tab-button').on('click', function() {
                 var tab = $(this).data('tab');
@@ -454,12 +569,66 @@ class Plugin_Redirect_Fixer {
                 $('#prf-tab-' + tab).addClass('active').show();
             });
 
-            // Сканирование контента
+            // Функция для отображения результатов
+            function displayResults(data, isFullScan) {
+                var html = '';
+                scanResults = data.posts || {};
+
+                if (isFullScan) {
+                    html = '<div class="notice notice-success"><p>✅ Сканирование завершено! Найдено постов с редиректами: ' + data.total_posts + ', всего редиректов: ' + data.total_redirects + '</p></div>';
+                } else {
+                    html = '<div class="notice notice-success"><p>✅ Сканирование страницы завершено! Найдено редиректов: ' + data.count + '</p></div>';
+                    // Формируем данные для одной страницы
+                    if (data.count > 0) {
+                        scanResults = {};
+                        scanResults[data.post_id] = {
+                            title: data.title,
+                            url: data.url,
+                            redirects: data.redirects
+                        };
+                    }
+                }
+
+                if (Object.keys(scanResults).length > 0) {
+                    $.each(scanResults, function(postId, postData) {
+                        html += '<div class="prf-post-item">';
+                        html += '<div class="prf-post-title">📄 ' + postData.title + '</div>';
+                        html += '<div style="margin-bottom: 10px;">';
+                        html += '<a href="' + postData.url + '" target="_blank">🔗 Просмотр</a> | ';
+                        html += '<a href="/wp-admin/post.php?post=' + postId + '&action=edit" target="_blank">✏️ Редактировать</a>';
+                        html += '</div>';
+                        html += '<div style="margin-top: 10px;">';
+
+                        $.each(postData.redirects, function(i, redirect) {
+                            html += '<div class="prf-redirect-item">';
+                            html += '<strong>🔴 Оригинальный URL:</strong> <code>' + redirect.original_url + '</code><br>';
+                            html += '<strong>🟢 Конечный URL:</strong> <code>' + redirect.final_url + '</code><br>';
+                            html += '<strong>🔄 Количество редиректов:</strong> ' + redirect.redirect_count;
+                            html += '</div>';
+                        });
+
+                        html += '</div>';
+                        html += '<button class="button button-primary prf-fix-button" data-post-id="' + postId + '" style="margin-top: 10px;">🔧 Исправить редиректы</button>';
+                        html += '</div>';
+                    });
+
+                    // Показываем кнопки экспорта
+                    $('#prf-export-buttons').show();
+                } else {
+                    html += '<div class="notice notice-info"><p>Редиректы не найдены</p></div>';
+                    $('#prf-export-buttons').hide();
+                }
+
+                $('#prf-scan-results').html(html);
+            }
+
+            // Сканирование всего сайта
             $('#prf-scan-button').on('click', function() {
                 var button = $(this);
                 button.prop('disabled', true).text('Сканирование...');
 
-                $('#prf-scan-results').html('<div class="notice notice-info"><p>Сканирование контента...</p></div>');
+                $('#prf-scan-results').html('<div class="notice notice-info"><p>⏳ Сканирование контента...</p></div>');
+                $('#prf-export-buttons').hide();
 
                 $.ajax({
                     url: ajaxurl,
@@ -470,41 +639,52 @@ class Plugin_Redirect_Fixer {
                     },
                     success: function(response) {
                         if (response.success) {
-                            var data = response.data;
-                            var html = '<div class="notice notice-success"><p>Сканирование завершено! Найдено постов с редиректами: ' + data.total_posts + ', всего редиректов: ' + data.total_redirects + '</p></div>';
-
-                            if (data.total_posts > 0) {
-                                $.each(data.posts, function(postId, postData) {
-                                    html += '<div class="prf-post-item">';
-                                    html += '<div class="prf-post-title">' + postData.title + '</div>';
-                                    html += '<a href="' + postData.url + '" target="_blank">Просмотр</a> | ';
-                                    html += '<a href="/wp-admin/post.php?post=' + postId + '&action=edit" target="_blank">Редактировать</a>';
-                                    html += '<div style="margin-top: 10px;">';
-
-                                    $.each(postData.redirects, function(i, redirect) {
-                                        html += '<div class="prf-redirect-item">';
-                                        html += '<strong>Оригинальный URL:</strong> ' + redirect.original_url + '<br>';
-                                        html += '<strong>Конечный URL:</strong> ' + redirect.final_url + '<br>';
-                                        html += '<strong>Количество редиректов:</strong> ' + redirect.redirect_count;
-                                        html += '</div>';
-                                    });
-
-                                    html += '</div>';
-                                    html += '<button class="button button-primary prf-fix-button" data-post-id="' + postId + '" style="margin-top: 10px;">Исправить редиректы</button>';
-                                    html += '</div>';
-                                });
-                            }
-
-                            $('#prf-scan-results').html(html);
+                            displayResults(response.data, true);
                         } else {
                             $('#prf-scan-results').html('<div class="notice notice-error"><p>' + response.data.message + '</p></div>');
                         }
-
-                        button.prop('disabled', false).text('Начать сканирование');
+                        button.prop('disabled', false).text('Начать полное сканирование');
                     },
                     error: function() {
                         $('#prf-scan-results').html('<div class="notice notice-error"><p>Произошла ошибка при сканировании</p></div>');
-                        button.prop('disabled', false).text('Начать сканирование');
+                        button.prop('disabled', false).text('Начать полное сканирование');
+                    }
+                });
+            });
+
+            // Сканирование одной страницы
+            $('#prf-scan-page-button').on('click', function() {
+                var button = $(this);
+                var pageUrl = $('#prf-page-url').val();
+
+                if (!pageUrl) {
+                    alert('Пожалуйста, введите URL страницы');
+                    return;
+                }
+
+                button.prop('disabled', true).text('Сканирование...');
+                $('#prf-scan-results').html('<div class="notice notice-info"><p>⏳ Сканирование страницы...</p></div>');
+                $('#prf-export-buttons').hide();
+
+                $.ajax({
+                    url: ajaxurl,
+                    type: 'POST',
+                    data: {
+                        action: 'prf_scan_single_page',
+                        nonce: '<?php echo wp_create_nonce('prf_nonce'); ?>',
+                        page_url: pageUrl
+                    },
+                    success: function(response) {
+                        if (response.success) {
+                            displayResults(response.data, false);
+                        } else {
+                            $('#prf-scan-results').html('<div class="notice notice-error"><p>' + response.data.message + '</p></div>');
+                        }
+                        button.prop('disabled', false).text('Сканировать страницу');
+                    },
+                    error: function() {
+                        $('#prf-scan-results').html('<div class="notice notice-error"><p>Произошла ошибка при сканировании</p></div>');
+                        button.prop('disabled', false).text('Сканировать страницу');
                     }
                 });
             });
@@ -564,6 +744,63 @@ class Plugin_Redirect_Fixer {
                 });
             });
 
+            // Экспорт в CSV
+            $('#prf-export-csv').on('click', function() {
+                exportResults('csv');
+            });
+
+            // Экспорт в JSON
+            $('#prf-export-json').on('click', function() {
+                exportResults('json');
+            });
+
+            // Функция экспорта результатов
+            function exportResults(format) {
+                if (Object.keys(scanResults).length === 0) {
+                    alert('Нет данных для экспорта');
+                    return;
+                }
+
+                $.ajax({
+                    url: ajaxurl,
+                    type: 'POST',
+                    data: {
+                        action: 'prf_export_results',
+                        nonce: '<?php echo wp_create_nonce('prf_nonce'); ?>',
+                        format: format,
+                        data: JSON.stringify(scanResults)
+                    },
+                    success: function(response) {
+                        if (response.success) {
+                            var data = response.data;
+
+                            // Создаем и скачиваем файл
+                            var blob = new Blob([data.content], {
+                                type: format === 'csv' ? 'text/csv;charset=utf-8;' : 'application/json;charset=utf-8;'
+                            });
+
+                            var link = document.createElement('a');
+                            var url = URL.createObjectURL(blob);
+
+                            link.setAttribute('href', url);
+                            link.setAttribute('download', data.filename);
+                            link.style.visibility = 'hidden';
+
+                            document.body.appendChild(link);
+                            link.click();
+                            document.body.removeChild(link);
+
+                            alert('✅ Файл ' + data.filename + ' успешно загружен!');
+                        } else {
+                            alert('Ошибка экспорта: ' + response.data.message);
+                        }
+                    },
+                    error: function() {
+                        alert('Произошла ошибка при экспорте данных');
+                    }
+                });
+            }
+
             // Проверка URL
             $('#prf-check-button').on('click', function() {
                 var url = $('#prf-check-url').val();
@@ -575,7 +812,7 @@ class Plugin_Redirect_Fixer {
                 }
 
                 button.prop('disabled', true).text('Проверка...');
-                $('#prf-check-results').html('<div class="notice notice-info"><p>Проверка URL...</p></div>');
+                $('#prf-check-results').html('<div class="notice notice-info"><p>⏳ Проверка URL...</p></div>');
 
                 $.ajax({
                     url: ajaxurl,
@@ -591,29 +828,29 @@ class Plugin_Redirect_Fixer {
                             var html = '';
 
                             if (data.has_redirect) {
-                                html += '<div class="notice notice-warning"><p>Обнаружен редирект!</p></div>';
+                                html += '<div class="notice notice-warning"><p>⚠️ Обнаружен редирект!</p></div>';
                                 html += '<div class="prf-redirect-item">';
-                                html += '<strong>Оригинальный URL:</strong> ' + data.original_url + '<br>';
-                                html += '<strong>Конечный URL:</strong> ' + data.final_url + '<br>';
-                                html += '<strong>Количество редиректов:</strong> ' + data.redirect_count + '<br>';
+                                html += '<strong>🔴 Оригинальный URL:</strong> <code>' + data.original_url + '</code><br>';
+                                html += '<strong>🟢 Конечный URL:</strong> <code>' + data.final_url + '</code><br>';
+                                html += '<strong>🔄 Количество редиректов:</strong> ' + data.redirect_count + '<br>';
 
                                 if (data.redirect_chain.length > 0) {
-                                    html += '<strong>Цепочка редиректов:</strong><br>';
+                                    html += '<strong>📋 Цепочка редиректов:</strong><br>';
                                     html += '<div class="prf-redirect-chain">';
                                     $.each(data.redirect_chain, function(i, item) {
-                                        html += (i + 1) + '. ' + item.url + ' (' + item.status + ') → ' + item.location + '<br>';
+                                        html += (i + 1) + '. <code>' + item.url + '</code> (HTTP ' + item.status + ') → <code>' + item.location + '</code><br>';
                                     });
                                     html += '</div>';
                                 }
 
                                 html += '</div>';
                             } else {
-                                html += '<div class="notice notice-success"><p>Редиректы не обнаружены</p></div>';
-                                html += '<p><strong>URL:</strong> ' + data.original_url + '</p>';
+                                html += '<div class="notice notice-success"><p>✅ Редиректы не обнаружены</p></div>';
+                                html += '<p><strong>URL:</strong> <code>' + data.original_url + '</code></p>';
                             }
 
                             if (data.error) {
-                                html += '<div class="notice notice-error"><p>Ошибка: ' + data.error + '</p></div>';
+                                html += '<div class="notice notice-error"><p>❌ Ошибка: ' + data.error + '</p></div>';
                             }
 
                             $('#prf-check-results').html(html);
