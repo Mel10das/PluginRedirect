@@ -2,8 +2,8 @@
 /**
  * Plugin Name: Plugin Redirect Fixer
  * Plugin URI: https://github.com/Mel10das/PluginRedirect
- * Description: Автоматически находит и заменяет ссылки с 301 редиректом на конечные URL в контенте WordPress. Поддержка экспорта в CSV/JSON и сканирования отдельных страниц.
- * Version: 1.1.0
+ * Description: Автоматически находит и заменяет ссылки с 301 редиректом на конечные URL. Пакетное сканирование для сайтов с тысячами страниц. Массовое исправление одним кликом.
+ * Version: 1.2.0
  * Author: Mel10das
  * Author URI: https://github.com/Mel10das
  * License: GPL v2 or later
@@ -61,6 +61,8 @@ class Plugin_Redirect_Fixer {
         add_action('wp_ajax_prf_check_url', array($this, 'ajax_check_url'));
         add_action('wp_ajax_prf_export_results', array($this, 'ajax_export_results'));
         add_action('wp_ajax_prf_scan_single_page', array($this, 'ajax_scan_single_page'));
+        add_action('wp_ajax_prf_get_posts_count', array($this, 'ajax_get_posts_count'));
+        add_action('wp_ajax_prf_fix_all_redirects', array($this, 'ajax_fix_all_redirects'));
     }
 
     /**
@@ -273,7 +275,7 @@ class Plugin_Redirect_Fixer {
     }
 
     /**
-     * AJAX: Сканирование контента
+     * AJAX: Сканирование контента (с пакетной обработкой)
      */
     public function ajax_scan_content() {
         check_ajax_referer('prf_nonce', 'nonce');
@@ -282,33 +284,27 @@ class Plugin_Redirect_Fixer {
             wp_send_json_error(array('message' => 'Недостаточно прав'));
         }
 
-        $post_id = isset($_POST['post_id']) ? intval($_POST['post_id']) : 0;
+        // Параметры пакетной обработки
+        $batch_size = 20; // Количество постов за раз
+        $offset = isset($_POST['offset']) ? intval($_POST['offset']) : 0;
 
-        if ($post_id > 0) {
-            $post = get_post($post_id);
-            if ($post) {
-                $redirects = $this->scan_content_for_redirects($post->post_content);
-                wp_send_json_success(array(
-                    'redirects' => $redirects,
-                    'count' => count($redirects)
-                ));
-            }
-        }
-
-        // Сканируем все посты
+        // Сканируем посты пакетами
         $args = array(
             'post_type' => array('post', 'page'),
-            'posts_per_page' => -1,
-            'post_status' => 'publish'
+            'posts_per_page' => $batch_size,
+            'offset' => $offset,
+            'post_status' => 'publish',
+            'orderby' => 'ID',
+            'order' => 'ASC'
         );
 
         $posts = get_posts($args);
-        $all_redirects = array();
+        $batch_redirects = array();
 
         foreach ($posts as $post) {
             $redirects = $this->scan_content_for_redirects($post->post_content);
             if (!empty($redirects)) {
-                $all_redirects[$post->ID] = array(
+                $batch_redirects[$post->ID] = array(
                     'title' => $post->post_title,
                     'url' => get_permalink($post->ID),
                     'redirects' => $redirects
@@ -316,12 +312,41 @@ class Plugin_Redirect_Fixer {
             }
         }
 
+        // Подсчитываем общее количество редиректов в этом пакете
+        $batch_redirect_count = 0;
+        foreach ($batch_redirects as $post_data) {
+            $batch_redirect_count += count($post_data['redirects']);
+        }
+
         wp_send_json_success(array(
-            'posts' => $all_redirects,
-            'total_posts' => count($all_redirects),
-            'total_redirects' => array_sum(array_map(function($item) {
-                return count($item['redirects']);
-            }, $all_redirects))
+            'posts' => $batch_redirects,
+            'batch_size' => count($posts),
+            'has_more' => count($posts) === $batch_size,
+            'next_offset' => $offset + $batch_size,
+            'batch_posts_with_redirects' => count($batch_redirects),
+            'batch_redirect_count' => $batch_redirect_count
+        ));
+    }
+
+    /**
+     * AJAX: Получение общего количества постов
+     */
+    public function ajax_get_posts_count() {
+        check_ajax_referer('prf_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => 'Недостаточно прав'));
+        }
+
+        $count_query = new WP_Query(array(
+            'post_type' => array('post', 'page'),
+            'post_status' => 'publish',
+            'posts_per_page' => -1,
+            'fields' => 'ids'
+        ));
+
+        wp_send_json_success(array(
+            'total_posts' => $count_query->found_posts
         ));
     }
 
@@ -380,6 +405,59 @@ class Plugin_Redirect_Fixer {
         }
 
         wp_send_json_error(array('message' => 'URL не указан'));
+    }
+
+    /**
+     * AJAX: Массовое исправление редиректов
+     */
+    public function ajax_fix_all_redirects() {
+        check_ajax_referer('prf_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => 'Недостаточно прав'));
+        }
+
+        $post_ids = isset($_POST['post_ids']) ? json_decode(stripslashes($_POST['post_ids']), true) : array();
+        $all_redirects = isset($_POST['all_redirects']) ? json_decode(stripslashes($_POST['all_redirects']), true) : array();
+
+        if (empty($post_ids) || empty($all_redirects)) {
+            wp_send_json_error(array('message' => 'Нет данных для исправления'));
+        }
+
+        $fixed_count = 0;
+        $failed_posts = array();
+
+        foreach ($post_ids as $post_id) {
+            if (!isset($all_redirects[$post_id])) {
+                continue;
+            }
+
+            $post = get_post($post_id);
+            if (!$post) {
+                $failed_posts[] = $post_id;
+                continue;
+            }
+
+            $redirects = $all_redirects[$post_id]['redirects'];
+            $updated_content = $this->fix_redirects_in_content($post->post_content, $redirects);
+
+            $result = wp_update_post(array(
+                'ID' => $post_id,
+                'post_content' => $updated_content
+            ));
+
+            if ($result) {
+                $fixed_count++;
+            } else {
+                $failed_posts[] = $post_id;
+            }
+        }
+
+        wp_send_json_success(array(
+            'fixed_posts' => $fixed_count,
+            'failed_posts' => $failed_posts,
+            'message' => sprintf('Исправлено %d из %d постов', $fixed_count, count($post_ids))
+        ));
     }
 
     /**
@@ -509,12 +587,20 @@ class Plugin_Redirect_Fixer {
                         <button id="prf-scan-page-button" class="button button-primary">Сканировать страницу</button>
                     </div>
 
+                    <div id="prf-scan-progress" style="margin-top: 20px; display: none;">
+                        <div style="background: #f0f0f0; border-radius: 5px; height: 30px; overflow: hidden;">
+                            <div id="prf-progress-bar" style="background: linear-gradient(90deg, #4caf50, #8bc34a); height: 100%; width: 0%; transition: width 0.3s; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold;"></div>
+                        </div>
+                        <p id="prf-progress-text" style="margin-top: 10px; text-align: center;"></p>
+                    </div>
+
                     <div id="prf-scan-results" style="margin-top: 20px;"></div>
 
                     <div id="prf-export-buttons" style="margin-top: 15px; display: none;">
-                        <h3>Экспорт результатов</h3>
+                        <h3>Экспорт и массовые операции</h3>
                         <button id="prf-export-csv" class="button">📥 Экспорт в CSV</button>
                         <button id="prf-export-json" class="button">📥 Экспорт в JSON</button>
+                        <button id="prf-fix-all" class="button button-primary" style="margin-left: 10px;">🔧 Исправить все редиректы</button>
                     </div>
                 </div>
 
@@ -676,31 +762,103 @@ class Plugin_Redirect_Fixer {
                 $('#prf-scan-results').html(html);
             }
 
-            // Сканирование всего сайта
+            // Сканирование всего сайта (пакетно)
             $('#prf-scan-button').on('click', function() {
                 var button = $(this);
-                button.prop('disabled', true).text('Сканирование...');
+                button.prop('disabled', true).text('⏳ Сканирование...');
 
-                $('#prf-scan-results').html('<div class="notice notice-info"><p>⏳ Сканирование контента...</p></div>');
+                // Скрываем результаты и показываем прогресс
+                $('#prf-scan-results').html('');
                 $('#prf-export-buttons').hide();
+                $('#prf-scan-progress').show();
+                $('#prf-progress-bar').css('width', '0%').text('0%');
 
+                // Очищаем предыдущие результаты
+                scanResults = {};
+
+                // Сначала получаем количество постов
                 $.ajax({
                     url: ajaxurl,
                     type: 'POST',
                     data: {
-                        action: 'prf_scan_content',
+                        action: 'prf_get_posts_count',
                         nonce: '<?php echo wp_create_nonce('prf_nonce'); ?>'
                     },
                     success: function(response) {
                         if (response.success) {
-                            displayResults(response.data, true);
+                            var totalPosts = response.data.total_posts;
+                            var offset = 0;
+                            var totalPostsWithRedirects = 0;
+                            var totalRedirectsCount = 0;
+
+                            // Запускаем пакетное сканирование
+                            function scanBatch() {
+                                $.ajax({
+                                    url: ajaxurl,
+                                    type: 'POST',
+                                    data: {
+                                        action: 'prf_scan_content',
+                                        nonce: '<?php echo wp_create_nonce('prf_nonce'); ?>',
+                                        offset: offset
+                                    },
+                                    success: function(batchResponse) {
+                                        if (batchResponse.success) {
+                                            var data = batchResponse.data;
+
+                                            // Добавляем результаты этого пакета
+                                            $.each(data.posts, function(postId, postData) {
+                                                scanResults[postId] = postData;
+                                            });
+
+                                            totalPostsWithRedirects += data.batch_posts_with_redirects;
+                                            totalRedirectsCount += data.batch_redirect_count;
+
+                                            // Обновляем прогресс
+                                            var processed = offset + data.batch_size;
+                                            var progress = Math.min(100, Math.round((processed / totalPosts) * 100));
+                                            $('#prf-progress-bar').css('width', progress + '%').text(progress + '%');
+                                            $('#prf-progress-text').text('Обработано: ' + processed + ' из ' + totalPosts + ' постов | Найдено редиректов: ' + totalRedirectsCount);
+
+                                            // Если есть еще посты, продолжаем
+                                            if (data.has_more) {
+                                                offset = data.next_offset;
+                                                setTimeout(scanBatch, 100); // Небольшая пауза между запросами
+                                            } else {
+                                                // Сканирование завершено
+                                                $('#prf-scan-progress').hide();
+
+                                                displayResults({
+                                                    posts: scanResults,
+                                                    total_posts: totalPostsWithRedirects,
+                                                    total_redirects: totalRedirectsCount
+                                                }, true);
+
+                                                button.prop('disabled', false).text('Начать полное сканирование');
+                                            }
+                                        } else {
+                                            $('#prf-scan-progress').hide();
+                                            $('#prf-scan-results').html('<div class="notice notice-error"><p>Ошибка: ' + batchResponse.data.message + '</p></div>');
+                                            button.prop('disabled', false).text('Начать полное сканирование');
+                                        }
+                                    },
+                                    error: function() {
+                                        $('#prf-scan-progress').hide();
+                                        $('#prf-scan-results').html('<div class="notice notice-error"><p>Произошла ошибка при сканировании пакета</p></div>');
+                                        button.prop('disabled', false).text('Начать полное сканирование');
+                                    }
+                                });
+                            }
+
+                            scanBatch();
                         } else {
-                            $('#prf-scan-results').html('<div class="notice notice-error"><p>' + response.data.message + '</p></div>');
+                            $('#prf-scan-progress').hide();
+                            $('#prf-scan-results').html('<div class="notice notice-error"><p>Ошибка получения количества постов</p></div>');
+                            button.prop('disabled', false).text('Начать полное сканирование');
                         }
-                        button.prop('disabled', false).text('Начать полное сканирование');
                     },
                     error: function() {
-                        $('#prf-scan-results').html('<div class="notice notice-error"><p>Произошла ошибка при сканировании</p></div>');
+                        $('#prf-scan-progress').hide();
+                        $('#prf-scan-results').html('<div class="notice notice-error"><p>Произошла ошибка при подсчете постов</p></div>');
                         button.prop('disabled', false).text('Начать полное сканирование');
                     }
                 });
@@ -852,6 +1010,65 @@ class Plugin_Redirect_Fixer {
                     }
                 });
             }
+
+            // Массовое исправление редиректов
+            $('#prf-fix-all').on('click', function() {
+                if (Object.keys(scanResults).length === 0) {
+                    alert('Нет данных для исправления');
+                    return;
+                }
+
+                var postIds = Object.keys(scanResults);
+                var totalRedirects = 0;
+                $.each(scanResults, function(postId, postData) {
+                    totalRedirects += postData.redirects.length;
+                });
+
+                if (!confirm('Вы уверены, что хотите исправить ' + totalRedirects + ' редиректов на ' + postIds.length + ' страницах?\n\nЭто действие изменит контент постов!')) {
+                    return;
+                }
+
+                var button = $(this);
+                button.prop('disabled', true).text('⏳ Исправление...');
+
+                $.ajax({
+                    url: ajaxurl,
+                    type: 'POST',
+                    data: {
+                        action: 'prf_fix_all_redirects',
+                        nonce: '<?php echo wp_create_nonce('prf_nonce'); ?>',
+                        post_ids: JSON.stringify(postIds),
+                        all_redirects: JSON.stringify(scanResults)
+                    },
+                    success: function(response) {
+                        if (response.success) {
+                            var data = response.data;
+                            alert('✅ ' + data.message + '\n\nУспешно: ' + data.fixed_posts + '\nОшибок: ' + data.failed_posts.length);
+
+                            // Убираем исправленные посты из результатов
+                            $.each(postIds, function(i, postId) {
+                                $('.prf-fix-button[data-post-id="' + postId + '"]').closest('.prf-post-item').fadeOut();
+                            });
+
+                            // Обновляем scanResults
+                            scanResults = {};
+
+                            setTimeout(function() {
+                                button.prop('disabled', false).text('🔧 Исправить все редиректы');
+                                $('#prf-export-buttons').hide();
+                                $('#prf-scan-results').html('<div class="notice notice-success"><p>✅ Все редиректы исправлены!</p></div>');
+                            }, 1000);
+                        } else {
+                            alert('Ошибка: ' + response.data.message);
+                            button.prop('disabled', false).text('🔧 Исправить все редиректы');
+                        }
+                    },
+                    error: function() {
+                        alert('Произошла ошибка при массовом исправлении');
+                        button.prop('disabled', false).text('🔧 Исправить все редиректы');
+                    }
+                });
+            });
 
             // Проверка URL
             $('#prf-check-button').on('click', function() {
